@@ -28,6 +28,9 @@ Releases are built by GitHub Actions when a tag like `v0.1.0` is pushed.
 - Config (with the API key, mode 0600): `~/.config/transly/config.json` (macOS: `~/Library/Application Support/transly/`).
 
 ## Limits
+- Rate limits are handled for you: requests are paced to 14 per minute (the free tier allows 15), and if Google
+  still answers "too many requests" or "overloaded" the app waits and retries. A long file simply takes longer
+  (about 200,000 characters per minute at most). Only the daily quota (500 requests) stops a job.
 - The free Gemini tier has a small daily request quota and Google may use free-tier data to improve its
   products. Don't translate confidential files.
 - DOCX: only the body text is translated (not headers/footers); formatting inside a paragraph is flattened.

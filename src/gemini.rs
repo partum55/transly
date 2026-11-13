@@ -1,6 +1,8 @@
 use base64::Engine;
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 // Flash-Lite tier: most free-tier headroom, and not a moving "-latest" alias that gets overloaded.
 const MODEL: &str = "gemini-3.5-flash-lite";
@@ -62,7 +64,63 @@ fn system(dir: Dir, prev: Prev) -> Value {
     json!({ "parts": [{ "text": rules(dir, prev) }] })
 }
 
-fn call(key: &str, body: Value) -> Result<String, String> {
+// ---------- rate limiting ----------
+// Free tier for this model: 15 requests/min, 250K tokens/min, 500 requests/day (see AI Studio > Rate limits).
+
+const RPM_LIMIT: usize = 14; // one below the real limit
+const WINDOW: Duration = Duration::from_secs(60);
+const MAX_RETRIES: u32 = 4;
+
+static SENT: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
+
+/// Sliding window. `None`: the request fits and is recorded. `Some(wait)`: wait until the oldest one leaves the window.
+fn reserve(sent: &mut VecDeque<Instant>, now: Instant, limit: usize, window: Duration) -> Option<Duration> {
+    while sent.front().is_some_and(|&t| now.duration_since(t) >= window) {
+        sent.pop_front();
+    }
+    if sent.len() < limit {
+        sent.push_back(now);
+        return None;
+    }
+    Some(window - now.duration_since(sent[0]))
+}
+
+/// Blocks until one more request fits under the per-minute limit. Every request (including retries) goes through here.
+fn pace() {
+    loop {
+        let wait = reserve(&mut SENT.lock().unwrap(), Instant::now(), RPM_LIMIT, WINDOW);
+        match wait {
+            None => return,
+            Some(w) => std::thread::sleep(w + Duration::from_millis(200)),
+        }
+    }
+}
+
+enum Fail {
+    /// Try again later: the delay Google asked for, or `None` for the default backoff.
+    Retry(Option<Duration>, String),
+    Fatal(String),
+}
+
+fn retry_delay(v: &Value) -> Option<Duration> {
+    let secs = v["error"]["details"].as_array()?.iter().find_map(|d| d["retryDelay"].as_str())?;
+    secs.trim_end_matches('s').parse::<f64>().ok().map(Duration::from_secs_f64)
+}
+
+fn classify(status: u16, v: &Value) -> Fail {
+    let msg = v["error"]["message"].as_str().unwrap_or("unknown error");
+    match status {
+        429 if v.to_string().contains("PerDay") => {
+            Fail::Fatal("The free daily quota is used up. Try again tomorrow.".into())
+        }
+        429 => Fail::Retry(retry_delay(v), "The free per-minute limit was reached.".into()),
+        500 | 502 | 503 | 504 => Fail::Retry(None, format!("Gemini is overloaded ({status}): {msg}")),
+        400 | 403 if msg.contains("API key") => Fail::Fatal("The API key was rejected. Check it in Settings.".into()),
+        _ => Fail::Fatal(format!("Gemini error {status}: {msg}")),
+    }
+}
+
+fn call_once(key: &str, body: &Value) -> Result<String, Fail> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(300)))
@@ -72,21 +130,15 @@ fn call(key: &str, body: Value) -> Result<String, String> {
     let mut resp = agent
         .post(&url)
         .header("x-goog-api-key", key)
-        .send_json(&body)
-        .map_err(|e| format!("Network error: {e}"))?;
+        .send_json(body)
+        .map_err(|e| Fail::Fatal(format!("Network error: {e}")))?;
     let status = resp.status().as_u16();
     let v: Value = resp
         .body_mut()
         .read_json()
-        .map_err(|e| format!("Bad response from Gemini: {e}"))?;
-
+        .map_err(|e| Fail::Fatal(format!("Bad response from Gemini: {e}")))?;
     if status != 200 {
-        let msg = v["error"]["message"].as_str().unwrap_or("unknown error");
-        return Err(match status {
-            429 => "Free-tier quota reached. Wait a bit (or until tomorrow) and try again.".into(),
-            400 | 403 if msg.contains("API key") => "The API key was rejected. Check it in Settings.".into(),
-            _ => format!("Gemini error {status}: {msg}"),
-        });
+        return Err(classify(status, &v));
     }
 
     let cand = &v["candidates"][0];
@@ -95,16 +147,34 @@ fn call(key: &str, body: Value) -> Result<String, String> {
         .map(|p| p.iter().filter_map(|x| x["text"].as_str()).collect())
         .unwrap_or_default();
     match cand["finishReason"].as_str() {
-        Some("MAX_TOKENS") => Err("Response was cut off (too long). Try a smaller input.".into()),
+        Some("MAX_TOKENS") => Err(Fail::Fatal("Response was cut off (too long). Try a smaller input.".into())),
         _ if text.is_empty() => {
             let why = cand["finishReason"]
                 .as_str()
                 .or(v["promptFeedback"]["blockReason"].as_str())
                 .unwrap_or("empty response");
-            Err(format!("Gemini returned nothing ({why})."))
+            Err(Fail::Fatal(format!("Gemini returned nothing ({why}).")))
         }
         _ => Ok(text),
     }
+}
+
+/// One paced request. Rate-limit and overload answers are waited out and retried instead of failing the job.
+fn call(key: &str, body: Value) -> Result<String, String> {
+    for attempt in 0..=MAX_RETRIES {
+        pace();
+        match call_once(key, &body) {
+            Ok(t) => return Ok(t),
+            Err(Fail::Fatal(m)) => return Err(m),
+            Err(Fail::Retry(_, m)) if attempt == MAX_RETRIES => return Err(format!("{m} Try again in a minute.")),
+            Err(Fail::Retry(wait, _)) => {
+                let backoff = Duration::from_secs(5 << attempt); // 5, 10, 20, 40 s
+                let wait = wait.map_or(backoff, |w| w + Duration::from_secs(1));
+                std::thread::sleep(wait.min(Duration::from_secs(90)));
+            }
+        }
+    }
+    unreachable!("loop returns on its last attempt")
 }
 
 /// A word that mixes Cyrillic and Latin letters, like "\u{412}ona". The model rarely glitches this way
@@ -204,6 +274,29 @@ mod tests {
         assert!(r.contains("from English into Ukrainian") && r.contains("Russianisms") && !r.contains("previous_source"));
         let r = rules(Dir { from: None, to: "German" }, Some(("a", "b")));
         assert!(r.contains("Detect the source language") && r.contains("<previous_source>\na\n") && !r.contains("Russianisms"));
+    }
+
+    #[test]
+    fn window_allows_limit_then_waits() {
+        let (t0, win) = (Instant::now(), Duration::from_secs(60));
+        let mut q = VecDeque::new();
+        for i in 0..3 {
+            assert!(reserve(&mut q, t0 + Duration::from_secs(i), 3, win).is_none());
+        }
+        // 4th at t=10s must wait until the first (t=0) leaves the window: 50s
+        assert_eq!(reserve(&mut q, t0 + Duration::from_secs(10), 3, win), Some(Duration::from_secs(50)));
+        assert!(reserve(&mut q, t0 + Duration::from_secs(61), 3, win).is_none()); // t=0 and t=1 have expired
+        assert_eq!(q.len(), 2); // t=2 plus the new one
+    }
+
+    #[test]
+    fn classifies_google_errors() {
+        let minute = json!({"error": {"message": "quota", "details": [{"retryDelay": "23s"}]}});
+        assert!(matches!(classify(429, &minute), Fail::Retry(Some(d), _) if d == Duration::from_secs(23)));
+        let day = json!({"error": {"message": "q", "details": [{"violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}});
+        assert!(matches!(classify(429, &day), Fail::Fatal(m) if m.contains("tomorrow")));
+        assert!(matches!(classify(503, &json!({})), Fail::Retry(None, _)));
+        assert!(matches!(classify(400, &json!({"error": {"message": "API key not valid"}})), Fail::Fatal(m) if m.contains("rejected")));
     }
 
     #[test]
