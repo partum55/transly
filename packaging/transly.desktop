@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Transly
+Comment=Translate text and files with Gemini
+Exec=transly
+Icon=transly
+Categories=Utility;
+StartupWMClass=transly
+Terminal=false

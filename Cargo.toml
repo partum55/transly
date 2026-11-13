@@ -1,0 +1,40 @@
+[package]
+name = "transly"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+dirs = "7.0.0"
+eframe = "0.37.0"
+markdown2pdf = "1.6.2"
+quick-xml = "0.42.0"
+rfd = "0.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tray-icon = "0.26.1"
+ureq = { version = "3.5.2", features = ["json"] }
+zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+global-hotkey = "0.10.0"
+
+[profile.release]
+strip = true
+lto = "thin"
+
+[package.metadata.deb]
+maintainer = "Transly <noreply@example.com>"
+section = "utils"
+priority = "optional"
+extended-description = "Translate text and files (txt, docx, pdf) with the free Gemini API. Tray icon, start at login."
+# libayatana-appindicator is dlopen()ed by the tray crate, so $auto can't see it
+depends = "$auto, libayatana-appindicator3-1"
+assets = [
+    ["target/release/transly", "usr/bin/", "755"],
+    ["packaging/transly.desktop", "usr/share/applications/", "644"],
+    ["packaging/icon.png", "usr/share/icons/hicolor/1024x1024/apps/transly.png", "644"],
+]
