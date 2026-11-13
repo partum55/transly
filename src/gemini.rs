@@ -4,8 +4,26 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-// Flash-Lite tier: most free-tier headroom, and not a moving "-latest" alias that gets overloaded.
-const MODEL: &str = "gemini-3.5-flash-lite";
+/// A model plus its own free-tier rate limit (every model has a separate quota, see AI Studio > Rate limits).
+struct Model {
+    id: &'static str,
+    rpm: usize,   // requests per minute we allow ourselves: one below the real limit
+    retries: u32, // how often to wait out a rate-limit/overload answer before giving up
+    sent: Mutex<VecDeque<Instant>>,
+}
+
+// Default: Flash-Lite has the most free-tier headroom (15 req/min, 500/day) and isn't a moving "-latest" alias.
+static FAST: Model = Model { id: "gemini-3.5-flash-lite", rpm: 14, retries: 4, sent: Mutex::new(VecDeque::new()) };
+// "Higher quality": more idiomatic but slow (it thinks first) and only 5 req/min, 20/day, so it falls back to FAST.
+static STRONG: Model = Model { id: "gemini-4-hydrogen", rpm: 4, retries: 1, sent: Mutex::new(VecDeque::new()) };
+
+static STRONG_PAUSED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+const STRONG_PAUSE: Duration = Duration::from_secs(15 * 60);
+
+/// True while the higher-quality model is being skipped (daily quota used up, or unavailable/overloaded).
+pub fn strong_paused() -> bool {
+    STRONG_PAUSED_UNTIL.lock().unwrap().is_some_and(|t| Instant::now() < t)
+}
 const MAX_PDF_BYTES: usize = 18 * 1024 * 1024; // inline request limit is ~20MB
 
 /// (display name, file-name code)
@@ -31,6 +49,8 @@ pub const LANGS: &[(&str, &str)] = &[
 pub struct Dir<'a> {
     pub from: Option<&'a str>,
     pub to: &'a str,
+    /// Use the higher-quality model; falls back to the fast one when that is unavailable.
+    pub strong: bool,
 }
 
 /// The tail of the part translated just before this one: (source, translation).
@@ -67,11 +87,7 @@ fn system(dir: Dir, prev: Prev) -> Value {
 // ---------- rate limiting ----------
 // Free tier for this model: 15 requests/min, 250K tokens/min, 500 requests/day (see AI Studio > Rate limits).
 
-const RPM_LIMIT: usize = 14; // one below the real limit
 const WINDOW: Duration = Duration::from_secs(60);
-const MAX_RETRIES: u32 = 4;
-
-static SENT: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
 
 /// Sliding window. `None`: the request fits and is recorded. `Some(wait)`: wait until the oldest one leaves the window.
 fn reserve(sent: &mut VecDeque<Instant>, now: Instant, limit: usize, window: Duration) -> Option<Duration> {
@@ -85,10 +101,10 @@ fn reserve(sent: &mut VecDeque<Instant>, now: Instant, limit: usize, window: Dur
     Some(window - now.duration_since(sent[0]))
 }
 
-/// Blocks until one more request fits under the per-minute limit. Every request (including retries) goes through here.
-fn pace() {
+/// Blocks until one more request fits under the model's per-minute limit. Every request (including retries) goes through here.
+fn pace(model: &Model) {
     loop {
-        let wait = reserve(&mut SENT.lock().unwrap(), Instant::now(), RPM_LIMIT, WINDOW);
+        let wait = reserve(&mut model.sent.lock().unwrap(), Instant::now(), model.rpm, WINDOW);
         match wait {
             None => return,
             Some(w) => std::thread::sleep(w + Duration::from_millis(200)),
@@ -99,6 +115,8 @@ fn pace() {
 enum Fail {
     /// Try again later: the delay Google asked for, or `None` for the default backoff.
     Retry(Option<Duration>, String),
+    /// This model can't be used for now (daily quota used up, or it doesn't exist).
+    Unavailable(String),
     Fatal(String),
 }
 
@@ -111,8 +129,9 @@ fn classify(status: u16, v: &Value) -> Fail {
     let msg = v["error"]["message"].as_str().unwrap_or("unknown error");
     match status {
         429 if v.to_string().contains("PerDay") => {
-            Fail::Fatal("The free daily quota is used up. Try again tomorrow.".into())
+            Fail::Unavailable("The free daily quota is used up. Try again tomorrow.".into())
         }
+        404 => Fail::Unavailable(format!("Model not available: {msg}")),
         429 => Fail::Retry(retry_delay(v), "The free per-minute limit was reached.".into()),
         500 | 502 | 503 | 504 => Fail::Retry(None, format!("Gemini is overloaded ({status}): {msg}")),
         400 | 403 if msg.contains("API key") => Fail::Fatal("The API key was rejected. Check it in Settings.".into()),
@@ -120,13 +139,13 @@ fn classify(status: u16, v: &Value) -> Fail {
     }
 }
 
-fn call_once(key: &str, body: &Value) -> Result<String, Fail> {
+fn call_once(model: &Model, key: &str, body: &Value) -> Result<String, Fail> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(300)))
         .build()
         .into();
-    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent");
+    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", model.id);
     let mut resp = agent
         .post(&url)
         .header("x-goog-api-key", key)
@@ -159,14 +178,22 @@ fn call_once(key: &str, body: &Value) -> Result<String, Fail> {
     }
 }
 
-/// One paced request. Rate-limit and overload answers are waited out and retried instead of failing the job.
-fn call(key: &str, body: Value) -> Result<String, String> {
-    for attempt in 0..=MAX_RETRIES {
-        pace();
-        match call_once(key, &body) {
+enum Out {
+    Unavailable(String),
+    Failed(String),
+}
+
+/// One paced request to one model. Rate-limit and overload answers are waited out and retried.
+fn call_on(model: &Model, key: &str, body: &Value) -> Result<String, Out> {
+    for attempt in 0..=model.retries {
+        pace(model);
+        match call_once(model, key, body) {
             Ok(t) => return Ok(t),
-            Err(Fail::Fatal(m)) => return Err(m),
-            Err(Fail::Retry(_, m)) if attempt == MAX_RETRIES => return Err(format!("{m} Try again in a minute.")),
+            Err(Fail::Fatal(m)) => return Err(Out::Failed(m)),
+            Err(Fail::Unavailable(m)) => return Err(Out::Unavailable(m)),
+            Err(Fail::Retry(_, m)) if attempt == model.retries => {
+                return Err(Out::Unavailable(format!("{m} Try again in a minute.")));
+            }
             Err(Fail::Retry(wait, _)) => {
                 let backoff = Duration::from_secs(5 << attempt); // 5, 10, 20, 40 s
                 let wait = wait.map_or(backoff, |w| w + Duration::from_secs(1));
@@ -175,6 +202,20 @@ fn call(key: &str, body: Value) -> Result<String, String> {
         }
     }
     unreachable!("loop returns on its last attempt")
+}
+
+/// `strong`: try the higher-quality model first; if it is unavailable or fails, use the fast one instead.
+fn call(key: &str, body: Value, strong: bool) -> Result<String, String> {
+    if strong && !strong_paused() {
+        match call_on(&STRONG, key, &body) {
+            Ok(t) => return Ok(t),
+            Err(Out::Unavailable(_)) => *STRONG_PAUSED_UNTIL.lock().unwrap() = Some(Instant::now() + STRONG_PAUSE),
+            Err(Out::Failed(_)) => {} // e.g. response cut off: the fast model may still manage
+        }
+    }
+    call_on(&FAST, key, &body).map_err(|e| match e {
+        Out::Unavailable(m) | Out::Failed(m) => m,
+    })
 }
 
 /// A word that mixes Cyrillic and Latin letters, like "\u{412}ona". The model rarely glitches this way
@@ -194,10 +235,10 @@ pub fn translate(key: &str, text: &str, dir: Dir, prev: Prev) -> Result<String, 
         "systemInstruction": system(dir, prev),
         "contents": [{ "parts": [{ "text": text }] }],
     });
-    let out = call(key, body.clone())?;
+    let out = call(key, body.clone(), dir.strong)?;
     if is_cyrillic_target(dir.to)
         && has_mixed_script(&out)
-        && let Ok(again) = call(key, body)
+        && let Ok(again) = call(key, body, dir.strong)
     {
         return Ok(again); // one retry; whatever it returns is final
     }
@@ -218,7 +259,7 @@ pub fn translate_batch(key: &str, items: &[String], dir: Dir, prev: Prev) -> Res
         },
     });
     let attempt = || -> Result<Vec<String>, String> {
-        let out = call(key, body.clone())?;
+        let out = call(key, body.clone(), dir.strong)?;
         let res: Vec<String> = serde_json::from_str(&out).map_err(|e| format!("Bad batch response: {e}"))?;
         if res.len() != items.len() {
             return Err(format!("Gemini returned {} items, expected {}.", res.len(), items.len()));
@@ -251,6 +292,7 @@ pub fn translate_pdf(key: &str, pdf: &[u8], dir: Dir) -> Result<String, String> 
                 { "text": format!("Translate this whole document into {}. Output Markdown that keeps headings (#), lists and tables. Put a blank line between every heading, paragraph, list and table, and keep each separate line of the original as its own paragraph.", dir.to) },
             ]}],
         }),
+        dir.strong,
     )
     .map(|md| strip_fence(&md))
 }
@@ -270,9 +312,9 @@ mod tests {
 
     #[test]
     fn rules_cover_direction_and_context() {
-        let r = rules(Dir { from: Some("English"), to: "Ukrainian" }, None);
+        let r = rules(Dir { from: Some("English"), to: "Ukrainian", strong: false }, None);
         assert!(r.contains("from English into Ukrainian") && r.contains("Russianisms") && !r.contains("previous_source"));
-        let r = rules(Dir { from: None, to: "German" }, Some(("a", "b")));
+        let r = rules(Dir { from: None, to: "German", strong: false }, Some(("a", "b")));
         assert!(r.contains("Detect the source language") && r.contains("<previous_source>\na\n") && !r.contains("Russianisms"));
     }
 
@@ -294,7 +336,8 @@ mod tests {
         let minute = json!({"error": {"message": "quota", "details": [{"retryDelay": "23s"}]}});
         assert!(matches!(classify(429, &minute), Fail::Retry(Some(d), _) if d == Duration::from_secs(23)));
         let day = json!({"error": {"message": "q", "details": [{"violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}});
-        assert!(matches!(classify(429, &day), Fail::Fatal(m) if m.contains("tomorrow")));
+        assert!(matches!(classify(429, &day), Fail::Unavailable(m) if m.contains("tomorrow")));
+        assert!(matches!(classify(404, &json!({"error": {"message": "not found"}})), Fail::Unavailable(_)));
         assert!(matches!(classify(503, &json!({})), Fail::Retry(None, _)));
         assert!(matches!(classify(400, &json!({"error": {"message": "API key not valid"}})), Fail::Fatal(m) if m.contains("rejected")));
     }
@@ -317,11 +360,11 @@ mod tests {
     #[ignore]
     fn live() {
         let key = std::env::var("GEMINI_API_KEY").expect("set GEMINI_API_KEY");
-        let uk = Dir { from: None, to: "Ukrainian" };
+        let uk = Dir { from: None, to: "Ukrainian", strong: false };
         let one = translate(&key, "Good morning, how are you?", uk, None).unwrap();
         println!("single: {one}");
         let items = vec!["Hello".to_string(), "See you tomorrow & goodbye".to_string()];
-        let many = translate_batch(&key, &items, Dir { from: Some("English"), to: "French" }, None).unwrap();
+        let many = translate_batch(&key, &items, Dir { from: Some("English"), to: "French", strong: false }, None).unwrap();
         println!("batch: {many:?}");
         assert_eq!(many.len(), 2);
         // rolling context: an ambiguous "bank" must follow the river sense set by the previous part

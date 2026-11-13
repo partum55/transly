@@ -18,6 +18,9 @@ Releases are built by GitHub Actions when a tag like `v0.1.0` is pushed.
 ## How it behaves
 - Pick the source (or "Detect language") and the target; ⇄ swaps them and moves the translation back into the
   input box, so English ↔ Ukrainian is one click. Ukrainian output is asked to be natural, without Russianisms.
+- "Higher quality" checkbox: uses a stronger, slower model (about 20 requests a day on the free tier, so use it for
+  things that matter). When its quota is used up or it is busy, the app silently falls back to the fast model and
+  says so next to the checkbox.
 - Context: long texts, DOCX files and pastes are translated in parts, and each part is told how the previous one
   was translated, so names and terms stay consistent through the whole document.
 - Linux: a tiny tray process starts at login; "Open Transly" or the shortcut opens a window, closing it quits

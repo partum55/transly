@@ -22,6 +22,7 @@ pub struct Config {
     pub source: String, // language code or "auto"
     pub target: String, // language code, see gemini::LANGS
     pub autostart: bool,
+    pub hq: bool, // "Higher quality": use the stronger, slower model
 }
 
 impl Config {

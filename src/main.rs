@@ -112,10 +112,23 @@ fn lang_bar(ui: &mut egui::Ui, cfg: &mut Config) -> (bool, bool) {
     ((cfg.source.clone(), cfg.target.clone()) != before, swapped)
 }
 
+/// "Higher quality" checkbox. Returns true when toggled.
+fn quality_box(ui: &mut egui::Ui, cfg: &mut Config) -> bool {
+    let changed = ui
+        .checkbox(&mut cfg.hq, "Higher quality")
+        .on_hover_text("Slower. Uses a stronger model (about 20 requests a day), then falls back to the fast one.")
+        .changed();
+    if cfg.hq && gemini::strong_paused() {
+        ui.weak("(quota used or busy: using the fast model)");
+    }
+    changed
+}
+
 fn direction(cfg: &Config) -> gemini::Dir<'static> {
     gemini::Dir {
         from: (cfg.source != "auto").then(|| lang_pair(&cfg.source).0),
         to: lang_pair(&cfg.target).0,
+        strong: cfg.hq,
     }
 }
 
@@ -212,7 +225,7 @@ impl App {
         self.key_busy = true;
         self.key_msg = "Checking the key…".into();
         self.spawn(ctx, move |send| {
-            let r = gemini::translate(&key, "Hello", gemini::Dir { from: None, to: "German" }, None).map(|_| ());
+            let r = gemini::translate(&key, "Hello", gemini::Dir { from: None, to: "German", strong: false }, None).map(|_| ());
             send(Ev::KeyChecked(key, r));
         });
     }
@@ -254,9 +267,10 @@ impl App {
     }
 
     fn text_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let (changed, swapped) = lang_bar(ui, &mut self.cfg);
-            if changed {
+            let hq_changed = quality_box(ui, &mut self.cfg);
+            if changed || hq_changed {
                 let _ = self.save_cfg();
             }
             if swapped && !self.output.is_empty() {
@@ -320,8 +334,9 @@ impl App {
             ui.label(format!("Selected: {}", p.display()));
         }
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if lang_bar(ui, &mut self.cfg).0 {
+        ui.horizontal_wrapped(|ui| {
+            let (changed, _) = lang_bar(ui, &mut self.cfg);
+            if changed | quality_box(ui, &mut self.cfg) {
                 let _ = self.save_cfg();
             }
             let can = self.file.is_some() && !self.file_busy;
