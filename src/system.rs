@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
 pub const SHORTCUT_HINT: &str = "Ctrl+Shift+Space";
@@ -125,6 +126,7 @@ impl Instance {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_self(arg: Option<&str>) {
     let Ok(exe) = std::env::current_exe() else { return };
     let mut cmd = Command::new(exe);

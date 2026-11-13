@@ -4,7 +4,7 @@ set -e
 VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 APP=dist/Transly.app
 rm -rf dist
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist/iconset dist/dmg
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist/transly.iconset dist/dmg
 
 for t in aarch64-apple-darwin x86_64-apple-darwin; do
   cargo build --release --target "$t"
@@ -13,10 +13,10 @@ lipo -create -output "$APP/Contents/MacOS/transly" \
   target/aarch64-apple-darwin/release/transly target/x86_64-apple-darwin/release/transly
 
 for s in 16 32 128 256 512; do
-  sips -z $s $s packaging/icon.png --out dist/iconset/icon_${s}x${s}.png >/dev/null
-  sips -z $((s * 2)) $((s * 2)) packaging/icon.png --out dist/iconset/icon_${s}x${s}@2x.png >/dev/null
+  sips -z $s $s packaging/icon.png --out dist/transly.iconset/icon_${s}x${s}.png >/dev/null
+  sips -z $((s * 2)) $((s * 2)) packaging/icon.png --out dist/transly.iconset/icon_${s}x${s}@2x.png >/dev/null
 done
-iconutil -c icns dist/iconset -o "$APP/Contents/Resources/transly.icns"
+iconutil -c icns dist/transly.iconset -o "$APP/Contents/Resources/transly.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
