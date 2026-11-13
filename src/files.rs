@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 
 const TEXT_CHUNK: usize = 15_000; // chars per request; few requests = friendly to the free-tier daily cap
 const BATCH_CHARS: usize = 8_000;
+const CONTEXT_CHARS: usize = 1_200; // tail of the previous part handed to the next request
 const DOC_XML: &str = "word/document.xml";
 
 type Progress<'a> = &'a dyn Fn(String);
 
-/// Returns every file written.
-pub fn run(key: &str, path: &Path, lang: (&str, &str), progress: Progress) -> Result<Vec<PathBuf>, String> {
-    let (name, code) = lang;
+/// Returns every file written. `code` is the target language code used in the output file name.
+pub fn run(key: &str, path: &Path, dir: gemini::Dir, code: &str, progress: Progress) -> Result<Vec<PathBuf>, String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("translated");
     let bytes = std::fs::read(path).map_err(|e| format!("Can't read file: {e}"))?;
@@ -23,12 +23,12 @@ pub fn run(key: &str, path: &Path, lang: (&str, &str), progress: Progress) -> Re
     let mut written = Vec::new();
     let (out_ext, data) = match ext.as_str() {
         "docx" => {
-            let data = translate_docx(&bytes, &mut |items| gemini::translate_batch(key, items, name), progress)?;
+            let data = translate_docx(&bytes, &mut |items, prev| gemini::translate_batch(key, items, dir, prev), progress)?;
             ("docx".to_string(), data)
         }
         "pdf" => {
             progress("Translating PDF…".into());
-            let md = gemini::translate_pdf(key, &bytes, name)?;
+            let md = gemini::translate_pdf(key, &bytes, dir)?;
             // keep the translated text even if rendering fails
             let md_path = path.with_file_name(format!("{stem}.{code}.md"));
             std::fs::write(&md_path, &md).map_err(|e| format!("Can't write {}: {e}", md_path.display()))?;
@@ -40,7 +40,7 @@ pub fn run(key: &str, path: &Path, lang: (&str, &str), progress: Progress) -> Re
         }
         _ => {
             let text = String::from_utf8(bytes).map_err(|_| "Unsupported file: need UTF-8 text, DOCX or PDF.".to_string())?;
-            let out = translate_text(&text, &mut |c| gemini::translate(key, c, name), progress)?;
+            let out = translate_text(&text, &mut |c, prev| gemini::translate(key, c, dir, prev), progress)?;
             (if ext.is_empty() { "txt".into() } else { ext }, out.into_bytes())
         }
     };
@@ -77,9 +77,23 @@ pub fn chunk(text: &str, max: usize) -> Vec<String> {
     out
 }
 
+/// Last `CONTEXT_CHARS` characters of `s`.
+fn tail(s: &str) -> &str {
+    let start = s.char_indices().rev().nth(CONTEXT_CHARS - 1).map_or(0, |(i, _)| i);
+    &s[start..]
+}
+
+type Prev = Option<(String, String)>; // owned (source tail, translation tail) of the previous part
+
+fn as_prev(p: &Prev) -> gemini::Prev<'_> {
+    p.as_ref().map(|(a, b)| (a.as_str(), b.as_str()))
+}
+
+/// Parts are translated in order, each one told how the part before it was translated,
+/// so terms, names and tone stay consistent across a long text.
 pub fn translate_text(
     text: &str,
-    tr: &mut dyn FnMut(&str) -> Result<String, String>,
+    tr: &mut dyn FnMut(&str, gemini::Prev) -> Result<String, String>,
     progress: Progress,
 ) -> Result<String, String> {
     if text.trim().is_empty() {
@@ -87,13 +101,15 @@ pub fn translate_text(
     }
     let chunks = chunk(text, TEXT_CHUNK);
     let mut out = String::new();
+    let mut prev: Prev = None;
     for (i, c) in chunks.iter().enumerate() {
         progress(format!("Translating part {}/{}…", i + 1, chunks.len()));
         if c.trim().is_empty() {
             out.push_str(c);
             continue;
         }
-        let t = tr(c)?;
+        let t = tr(c, as_prev(&prev))?;
+        prev = Some((tail(c).to_string(), tail(&t).to_string()));
         // models tend to strip trailing newlines; restore what the source had
         let trailing = c.len() - c.trim_end_matches('\n').len();
         out.push_str(t.trim_end_matches('\n'));
@@ -104,7 +120,7 @@ pub fn translate_text(
 
 // ---------- DOCX ----------
 
-type BatchFn<'a> = &'a mut dyn FnMut(&[String]) -> Result<Vec<String>, String>;
+type BatchFn<'a> = &'a mut dyn FnMut(&[String], gemini::Prev) -> Result<Vec<String>, String>;
 
 // ponytail: only word/document.xml (body, tables); headers/footers/footnotes are left untranslated.
 // Inline formatting inside a paragraph is flattened to the paragraph's first run.
@@ -135,10 +151,13 @@ pub fn translate_docx(docx: &[u8], tr: BatchFn, progress: Progress) -> Result<Ve
     }
 
     let mut translated: Vec<Option<String>> = vec![None; paras.len()];
+    let mut prev: Prev = None;
     for (n, b) in batches.iter().enumerate() {
         progress(format!("Translating part {}/{}…", n + 1, batches.len()));
         let input: Vec<String> = b.iter().map(|&i| paras[i].clone()).collect();
-        for (&i, t) in b.iter().zip(tr(&input)?) {
+        let out = tr(&input, as_prev(&prev))?;
+        prev = Some((tail(&input.join("\n")).to_string(), tail(&out.join("\n")).to_string()));
+        for (&i, t) in b.iter().zip(out) {
             translated[i] = Some(t);
         }
     }
@@ -277,7 +296,7 @@ mod tests {
         let mut seen = vec![];
         let out = translate_docx(
             &make_docx(),
-            &mut |items| {
+            &mut |items, _| {
                 seen.extend_from_slice(items);
                 Ok(items.iter().map(|s| s.to_uppercase() + " <&>").collect())
             },
@@ -310,8 +329,33 @@ mod tests {
     }
 
     #[test]
+    fn later_parts_get_the_previous_part_as_context() {
+        let text = format!("{}\n{}\n", "a".repeat(10_000), "b".repeat(10_000)); // two chunks
+        let mut seen: Vec<Option<(usize, usize)>> = vec![];
+        let out = translate_text(
+            &text,
+            &mut |c, prev| {
+                seen.push(prev.map(|(s, t)| (s.chars().filter(|&x| x == 'a').count(), t.chars().filter(|&x| x == 'A').count())));
+                Ok(c.to_uppercase())
+            },
+            &|_| {},
+        )
+        .unwrap();
+        // the tail is the last CONTEXT_CHARS chars of the chunk, which ends with a newline
+        assert_eq!(seen, [None, Some((CONTEXT_CHARS - 1, CONTEXT_CHARS - 1))]);
+        assert_eq!(out.len(), text.len());
+    }
+
+    #[test]
+    fn tail_is_char_safe() {
+        let s = "я".repeat(2_000); // 2 bytes per char
+        assert_eq!(tail(&s).chars().count(), CONTEXT_CHARS);
+        assert_eq!(tail("short"), "short");
+    }
+
+    #[test]
     fn text_keeps_trailing_newlines() {
-        let out = translate_text("a\n\nb\n", &mut |c| Ok(c.to_uppercase().trim_end().to_string()), &|_| {}).unwrap();
+        let out = translate_text("a\n\nb\n", &mut |c, _| Ok(c.to_uppercase().trim_end().to_string()), &|_| {}).unwrap();
         assert_eq!(out, "A\n\nB\n");
     }
 }

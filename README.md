@@ -16,6 +16,10 @@ Build from source: `cargo build --release` (Linux needs `libgtk-3-dev libayatana
 Releases are built by GitHub Actions when a tag like `v0.1.0` is pushed.
 
 ## How it behaves
+- Pick the source (or "Detect language") and the target; ⇄ swaps them and moves the translation back into the
+  input box, so English ↔ Ukrainian is one click. Ukrainian output is asked to be natural, without Russianisms.
+- Context: long texts, DOCX files and pastes are translated in parts, and each part is told how the previous one
+  was translated, so names and terms stay consistent through the whole document.
 - Linux: a tiny tray process starts at login; "Open Transly" or the shortcut opens a window, closing it quits
   that window (Wayland can't hide windows). The shortcut is registered for GNOME only.
 - macOS: one process; closing the window hides it to the menu bar.

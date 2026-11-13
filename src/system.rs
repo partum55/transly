@@ -19,6 +19,7 @@ pub const SHORTCUT_HINT: &str = "Ctrl+Shift+Space";
 #[serde(default)]
 pub struct Config {
     pub api_key: String,
+    pub source: String, // language code or "auto"
     pub target: String, // language code, see gemini::LANGS
     pub autostart: bool,
 }
@@ -33,10 +34,23 @@ impl Config {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        if c.source.is_empty() {
+            c.source = "auto".into();
+        }
         if c.target.is_empty() {
-            c.target = "en".into();
+            c.target = "uk".into();
         }
         c
+    }
+
+    /// Swap source and target. With auto-detect there's no known source, so flip between English and Ukrainian.
+    pub fn swap(&mut self) {
+        let old_source = std::mem::replace(&mut self.source, std::mem::take(&mut self.target));
+        self.target = match old_source.as_str() {
+            "auto" if self.source == "en" => "uk".into(),
+            "auto" => "en".into(),
+            _ => old_source,
+        };
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -310,6 +324,22 @@ mod tests {
         assert_eq!(add_to_list("@as []", "/t/"), "['/t/']");
         assert_eq!(add_to_list("['/a/']", "/t/"), "['/a/', '/t/']");
         assert_eq!(add_to_list("['/a/', '/t/']", "/t/"), "['/a/', '/t/']");
+    }
+
+    #[test]
+    fn swap_flips_direction() {
+        let mut c = Config { source: "auto".into(), target: "uk".into(), ..Default::default() };
+        c.swap();
+        assert_eq!((c.source.as_str(), c.target.as_str()), ("uk", "en"));
+        c.swap();
+        assert_eq!((c.source.as_str(), c.target.as_str()), ("en", "uk"));
+        c.target = "de".into();
+        c.swap(); // explicit source: plain swap
+        assert_eq!((c.source.as_str(), c.target.as_str()), ("de", "en"));
+        c.source = "auto".into();
+        c.target = "de".into();
+        c.swap(); // auto with a non-English target: the source becomes that language, target English
+        assert_eq!((c.source.as_str(), c.target.as_str()), ("de", "en"));
     }
 
     #[test]

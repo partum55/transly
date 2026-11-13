@@ -9,6 +9,7 @@ const MAX_PDF_BYTES: usize = 18 * 1024 * 1024; // inline request limit is ~20MB
 /// (display name, file-name code)
 pub const LANGS: &[(&str, &str)] = &[
     ("English", "en"),
+    ("Ukrainian", "uk"),
     ("German", "de"),
     ("French", "fr"),
     ("Spanish", "es"),
@@ -16,7 +17,6 @@ pub const LANGS: &[(&str, &str)] = &[
     ("Portuguese", "pt"),
     ("Dutch", "nl"),
     ("Polish", "pl"),
-    ("Ukrainian", "uk"),
     ("Russian", "ru"),
     ("Turkish", "tr"),
     ("Chinese (Simplified)", "zh"),
@@ -24,13 +24,42 @@ pub const LANGS: &[(&str, &str)] = &[
     ("Korean", "ko"),
 ];
 
-const RULES: &str = "You are a professional translator. Detect the source language automatically. \
-Translate faithfully into {lang}. Keep meaning, tone, line breaks, markdown, numbers, URLs, \
-code and timestamps unchanged. If the text is already in {lang}, return it unchanged. \
-Output only the translation, no commentary.";
+/// Translation direction by language name. `from: None` means detect automatically.
+#[derive(Clone, Copy)]
+pub struct Dir<'a> {
+    pub from: Option<&'a str>,
+    pub to: &'a str,
+}
 
-fn system(lang: &str) -> Value {
-    json!({ "parts": [{ "text": RULES.replace("{lang}", lang) }] })
+/// The tail of the part translated just before this one: (source, translation).
+pub type Prev<'a> = Option<(&'a str, &'a str)>;
+
+fn rules(dir: Dir, prev: Prev) -> String {
+    let to = dir.to;
+    let mut s = match dir.from {
+        Some(from) => format!("You are a professional translator. Translate from {from} into {to}."),
+        None => format!("You are a professional translator. Detect the source language and translate into {to}."),
+    };
+    s += &format!(
+        " Translate faithfully and naturally: convey meaning, tone and register the way a native speaker \
+         would write, not word for word. Keep line breaks, markdown, numbers, URLs, code and timestamps \
+         unchanged. If the text is already in {to}, return it unchanged. Output only the translation, no commentary."
+    );
+    if to == "Ukrainian" {
+        s += " Write natural modern Ukrainian: avoid Russianisms, surzhyk and word-for-word calques.";
+    }
+    if let Some((src, tr)) = prev {
+        s += &format!(
+            "\n\nThis text continues a longer document. Here is the part just before it, ONLY so that terms, names \
+             and tone stay consistent (never translate or repeat it):\n<previous_source>\n{src}\n</previous_source>\n\
+             <previous_translation>\n{tr}\n</previous_translation>"
+        );
+    }
+    s
+}
+
+fn system(dir: Dir, prev: Prev) -> Value {
+    json!({ "parts": [{ "text": rules(dir, prev) }] })
 }
 
 fn call(key: &str, body: Value) -> Result<String, String> {
@@ -78,25 +107,25 @@ fn call(key: &str, body: Value) -> Result<String, String> {
     }
 }
 
-pub fn translate(key: &str, text: &str, lang: &str) -> Result<String, String> {
+pub fn translate(key: &str, text: &str, dir: Dir, prev: Prev) -> Result<String, String> {
     call(
         key,
         json!({
-            "systemInstruction": system(lang),
+            "systemInstruction": system(dir, prev),
             "contents": [{ "parts": [{ "text": text }] }],
         }),
     )
 }
 
 /// Translates each string independently; result has the same length and order.
-pub fn translate_batch(key: &str, items: &[String], lang: &str) -> Result<Vec<String>, String> {
+pub fn translate_batch(key: &str, items: &[String], dir: Dir, prev: Prev) -> Result<Vec<String>, String> {
     let input = serde_json::to_string(items).map_err(|e| e.to_string())?;
     let out = call(
         key,
         json!({
             "systemInstruction": { "parts": [{ "text": format!(
-                "{} The input is a JSON array of strings. Return a JSON array of the same length, \
-                 where item i is the translation of input item i.", RULES.replace("{lang}", lang)) }] },
+                "{}\n\nThe input is a JSON array of strings. Return a JSON array of the same length, \
+                 where item i is the translation of input item i.", rules(dir, prev)) }] },
             "contents": [{ "parts": [{ "text": input }] }],
             "generationConfig": {
                 "responseMimeType": "application/json",
@@ -113,18 +142,18 @@ pub fn translate_batch(key: &str, items: &[String], lang: &str) -> Result<Vec<St
 
 /// Gemini reads PDFs natively; returns the translated content as Markdown.
 // ponytail: one request for the whole PDF; very long PDFs can hit the output-token cap. Split by page if needed.
-pub fn translate_pdf(key: &str, pdf: &[u8], lang: &str) -> Result<String, String> {
+pub fn translate_pdf(key: &str, pdf: &[u8], dir: Dir) -> Result<String, String> {
     if pdf.len() > MAX_PDF_BYTES {
         return Err("PDF is larger than 18 MB, which is too big to send.".into());
     }
     call(
         key,
         json!({
-            "systemInstruction": system(lang),
+            "systemInstruction": system(dir, None),
             "contents": [{ "parts": [
                 { "inline_data": { "mime_type": "application/pdf",
                                    "data": base64::engine::general_purpose::STANDARD.encode(pdf) } },
-                { "text": format!("Translate this whole document into {lang}. Output Markdown that keeps headings (#), lists and tables. Put a blank line between every heading, paragraph, list and table, and keep each separate line of the original as its own paragraph.") },
+                { "text": format!("Translate this whole document into {}. Output Markdown that keeps headings (#), lists and tables. Put a blank line between every heading, paragraph, list and table, and keep each separate line of the original as its own paragraph.", dir.to) },
             ]}],
         }),
     )
@@ -145,6 +174,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rules_cover_direction_and_context() {
+        let r = rules(Dir { from: Some("English"), to: "Ukrainian" }, None);
+        assert!(r.contains("from English into Ukrainian") && r.contains("Russianisms") && !r.contains("previous_source"));
+        let r = rules(Dir { from: None, to: "German" }, Some(("a", "b")));
+        assert!(r.contains("Detect the source language") && r.contains("<previous_source>\na\n") && !r.contains("Russianisms"));
+    }
+
+    #[test]
     fn fence_stripping() {
         assert_eq!(strip_fence("```markdown\n# A\n\ntext\n```\n"), "# A\n\ntext");
         assert_eq!(strip_fence("# A\n\n```rust\ncode\n```\n"), "# A\n\n```rust\ncode\n```\n");
@@ -155,11 +192,15 @@ mod tests {
     #[ignore]
     fn live() {
         let key = std::env::var("GEMINI_API_KEY").expect("set GEMINI_API_KEY");
-        let one = translate(&key, "Good morning, how are you?", "German").unwrap();
+        let uk = Dir { from: None, to: "Ukrainian" };
+        let one = translate(&key, "Good morning, how are you?", uk, None).unwrap();
         println!("single: {one}");
         let items = vec!["Hello".to_string(), "See you tomorrow & goodbye".to_string()];
-        let many = translate_batch(&key, &items, "French").unwrap();
+        let many = translate_batch(&key, &items, Dir { from: Some("English"), to: "French" }, None).unwrap();
         println!("batch: {many:?}");
         assert_eq!(many.len(), 2);
+        // rolling context: "bank" must follow the river sense set by the previous part
+        let ctx = translate(&key, "The bank was muddy.", uk, Some(("We sat by the river and watched the water.", "Ми сиділи біля річки й дивилися на воду."))).unwrap();
+        println!("with context: {ctx}");
     }
 }

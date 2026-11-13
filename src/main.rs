@@ -86,16 +86,37 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn lang_combo(ui: &mut egui::Ui, code: &mut String) -> bool {
-    let before = code.clone();
-    egui::ComboBox::from_id_salt("lang").selected_text(lang_pair(code).0).show_ui(ui, |ui| {
+fn lang_combo(ui: &mut egui::Ui, id: &str, code: &mut String, with_auto: bool) {
+    let shown = if code == "auto" { "Detect language" } else { lang_pair(code).0 };
+    egui::ComboBox::from_id_salt(id).selected_text(shown).show_ui(ui, |ui| {
+        if with_auto && ui.selectable_label(code == "auto", "Detect language").clicked() {
+            *code = "auto".into();
+        }
         for (name, c) in gemini::LANGS {
             if ui.selectable_label(code == c, *name).clicked() {
                 *code = c.to_string();
             }
         }
     });
-    *code != before
+}
+
+/// `[Source v] <-> [Target v]`. Returns (anything changed, swap button pressed).
+fn lang_bar(ui: &mut egui::Ui, cfg: &mut Config) -> (bool, bool) {
+    let before = (cfg.source.clone(), cfg.target.clone());
+    lang_combo(ui, "src", &mut cfg.source, true);
+    let swapped = ui.button("\u{21C4}").on_hover_text("Swap languages").clicked();
+    if swapped {
+        cfg.swap();
+    }
+    lang_combo(ui, "dst", &mut cfg.target, false);
+    ((cfg.source.clone(), cfg.target.clone()) != before, swapped)
+}
+
+fn direction(cfg: &Config) -> gemini::Dir<'static> {
+    gemini::Dir {
+        from: (cfg.source != "auto").then(|| lang_pair(&cfg.source).0),
+        to: lang_pair(&cfg.target).0,
+    }
 }
 
 impl App {
@@ -163,9 +184,9 @@ impl App {
         }
         self.text_busy = true;
         self.text_msg.clear();
-        let (key, text, lang) = (self.cfg.api_key.clone(), self.input.clone(), lang_pair(&self.cfg.target).0);
+        let (key, text, dir) = (self.cfg.api_key.clone(), self.input.clone(), direction(&self.cfg));
         self.spawn(ctx, move |send| {
-            send(Ev::Translated(files::translate_text(&text, &mut |c| gemini::translate(&key, c, lang), &|_| {})))
+            send(Ev::Translated(files::translate_text(&text, &mut |c, prev| gemini::translate(&key, c, dir, prev), &|_| {})))
         });
     }
 
@@ -176,9 +197,9 @@ impl App {
         }
         self.file_busy = true;
         self.file_msg = "Working…".into();
-        let (key, lang) = (self.cfg.api_key.clone(), lang_pair(&self.cfg.target));
+        let (key, dir, code) = (self.cfg.api_key.clone(), direction(&self.cfg), lang_pair(&self.cfg.target).1);
         self.spawn(ctx, move |send| {
-            let r = files::run(&key, &path, lang, &|m| send(Ev::Progress(m)));
+            let r = files::run(&key, &path, dir, code, &|m| send(Ev::Progress(m)));
             send(Ev::FileDone(r));
         });
     }
@@ -191,7 +212,7 @@ impl App {
         self.key_busy = true;
         self.key_msg = "Checking the key…".into();
         self.spawn(ctx, move |send| {
-            let r = gemini::translate(&key, "Hello", "German").map(|_| ());
+            let r = gemini::translate(&key, "Hello", gemini::Dir { from: None, to: "German" }, None).map(|_| ());
             send(Ev::KeyChecked(key, r));
         });
     }
@@ -234,9 +255,12 @@ impl App {
 
     fn text_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
-            ui.label("Translate to");
-            if lang_combo(ui, &mut self.cfg.target) {
+            let (changed, swapped) = lang_bar(ui, &mut self.cfg);
+            if changed {
                 let _ = self.save_cfg();
+            }
+            if swapped && !self.output.is_empty() {
+                self.input = std::mem::take(&mut self.output); // the translation becomes the text to translate back
             }
             let can = !self.text_busy && !self.input.trim().is_empty();
             let label = if self.text_busy { "Translating…" } else { "Translate" };
@@ -297,8 +321,7 @@ impl App {
         }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label("Translate to");
-            if lang_combo(ui, &mut self.cfg.target) {
+            if lang_bar(ui, &mut self.cfg).0 {
                 let _ = self.save_cfg();
             }
             let can = self.file.is_some() && !self.file_busy;
