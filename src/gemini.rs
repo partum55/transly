@@ -107,35 +107,60 @@ fn call(key: &str, body: Value) -> Result<String, String> {
     }
 }
 
+/// A word that mixes Cyrillic and Latin letters, like "\u{412}ona". The model rarely glitches this way
+/// when writing Cyrillic. Hyphenated forms such as "USB-порт" are separate letter runs and are fine.
+fn has_mixed_script(s: &str) -> bool {
+    s.split(|c: char| !c.is_alphabetic()).any(|w| {
+        w.chars().any(|c| ('\u{400}'..='\u{4FF}').contains(&c)) && w.chars().any(|c| c.is_ascii_alphabetic())
+    })
+}
+
+fn is_cyrillic_target(to: &str) -> bool {
+    matches!(to, "Ukrainian" | "Russian")
+}
+
 pub fn translate(key: &str, text: &str, dir: Dir, prev: Prev) -> Result<String, String> {
-    call(
-        key,
-        json!({
-            "systemInstruction": system(dir, prev),
-            "contents": [{ "parts": [{ "text": text }] }],
-        }),
-    )
+    let body = json!({
+        "systemInstruction": system(dir, prev),
+        "contents": [{ "parts": [{ "text": text }] }],
+    });
+    let out = call(key, body.clone())?;
+    if is_cyrillic_target(dir.to)
+        && has_mixed_script(&out)
+        && let Ok(again) = call(key, body)
+    {
+        return Ok(again); // one retry; whatever it returns is final
+    }
+    Ok(out)
 }
 
 /// Translates each string independently; result has the same length and order.
 pub fn translate_batch(key: &str, items: &[String], dir: Dir, prev: Prev) -> Result<Vec<String>, String> {
     let input = serde_json::to_string(items).map_err(|e| e.to_string())?;
-    let out = call(
-        key,
-        json!({
-            "systemInstruction": { "parts": [{ "text": format!(
-                "{}\n\nThe input is a JSON array of strings. Return a JSON array of the same length, \
-                 where item i is the translation of input item i.", rules(dir, prev)) }] },
-            "contents": [{ "parts": [{ "text": input }] }],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "responseSchema": { "type": "ARRAY", "items": { "type": "STRING" } },
-            },
-        }),
-    )?;
-    let res: Vec<String> = serde_json::from_str(&out).map_err(|e| format!("Bad batch response: {e}"))?;
-    if res.len() != items.len() {
-        return Err(format!("Gemini returned {} items, expected {}.", res.len(), items.len()));
+    let body = json!({
+        "systemInstruction": { "parts": [{ "text": format!(
+            "{}\n\nThe input is a JSON array of strings. Return a JSON array of the same length, \
+             where item i is the translation of input item i.", rules(dir, prev)) }] },
+        "contents": [{ "parts": [{ "text": input }] }],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": { "type": "ARRAY", "items": { "type": "STRING" } },
+        },
+    });
+    let attempt = || -> Result<Vec<String>, String> {
+        let out = call(key, body.clone())?;
+        let res: Vec<String> = serde_json::from_str(&out).map_err(|e| format!("Bad batch response: {e}"))?;
+        if res.len() != items.len() {
+            return Err(format!("Gemini returned {} items, expected {}.", res.len(), items.len()));
+        }
+        Ok(res)
+    };
+    let res = attempt()?;
+    if is_cyrillic_target(dir.to)
+        && res.iter().any(|t| has_mixed_script(t))
+        && let Ok(again) = attempt()
+    {
+        return Ok(again);
     }
     Ok(res)
 }
@@ -182,6 +207,13 @@ mod tests {
     }
 
     #[test]
+    fn mixed_script_detection() {
+        assert!(has_mixed_script("\u{412}ona \u{43f}\u{456}\u{448}\u{43b}\u{430}")); // Cyrillic B + Latin "ona"
+        assert!(!has_mixed_script("USB-\u{43f}\u{43e}\u{440}\u{442}, Wi-Fi \u{43c}\u{435}\u{440}\u{435}\u{436}\u{430}"));
+        assert!(!has_mixed_script("\u{414}\u{43e}\u{431}\u{440}\u{43e}\u{433}\u{43e} \u{440}\u{430}\u{43d}\u{43a}\u{443}, hello"));
+    }
+
+    #[test]
     fn fence_stripping() {
         assert_eq!(strip_fence("```markdown\n# A\n\ntext\n```\n"), "# A\n\ntext");
         assert_eq!(strip_fence("# A\n\n```rust\ncode\n```\n"), "# A\n\n```rust\ncode\n```\n");
@@ -199,8 +231,11 @@ mod tests {
         let many = translate_batch(&key, &items, Dir { from: Some("English"), to: "French" }, None).unwrap();
         println!("batch: {many:?}");
         assert_eq!(many.len(), 2);
-        // rolling context: "bank" must follow the river sense set by the previous part
-        let ctx = translate(&key, "The bank was muddy.", uk, Some(("We sat by the river and watched the water.", "Ми сиділи біля річки й дивилися на воду."))).unwrap();
-        println!("with context: {ctx}");
+        // rolling context: an ambiguous "bank" must follow the river sense set by the previous part
+        let sentence = "She walked to the bank.";
+        let alone = translate(&key, sentence, uk, None).unwrap();
+        let prev = ("We sat by the river and watched the water.", "Ми сиділи біля річки й дивилися на воду.");
+        let with = translate(&key, sentence, uk, Some(prev)).unwrap();
+        println!("without context: {alone}\nwith context:    {with}");
     }
 }
